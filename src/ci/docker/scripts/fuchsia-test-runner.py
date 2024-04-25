@@ -282,11 +282,11 @@ class TestEnvironment:
         product_name = "minimal." + self.triple_to_arch(self.target)
         fuchsia_version = "20.20240412.3.1"
 
-        # FIXME: We should be able to replace this with the machine parsable
-        # `ffx --machine json product lookup ...` once F15 is released.
         out = subprocess.check_output(
             [
                 ffx_path,
+                "--machine",
+                "json",
                 "product",
                 "lookup",
                 product_name,
@@ -300,15 +300,14 @@ class TestEnvironment:
 
         self.log_debug(out)
 
-        for line in io.BytesIO(out):
-            if line.startswith(b"gs://"):
-                transfer_manifest_url = line.rstrip()
-                break
-        else:
+        try:
+            transfer_manifest_url = json.loads(out)["transfer_manifest_url"]
+        except Exception as e:
+            print(e)
             raise Exception("Unable to parse transfer manifest")
 
         # Download the product bundle.
-        product_bundle_dir = os.path.join(self.tmp_dir(), 'product-bundle')
+        product_bundle_dir = os.path.join(self.tmp_dir(), "product-bundle")
         subprocess.check_call(
             [
                 ffx_path,
@@ -348,47 +347,10 @@ class TestEnvironment:
         self.log_info("Creating package repo...")
         subprocess.check_call(
             [
-                self.tool_path("pm"),
-                "newrepo",
-                "-repo",
-                self.repo_dir(),
-            ],
-            stdout=self.subprocess_output(),
-            stderr=self.subprocess_output(),
-        )
-
-        # Add repo
-        subprocess.check_call(
-            [
                 ffx_path,
                 "repository",
-                "add-from-pm",
+                "create",
                 self.repo_dir(),
-                "--repository",
-                self.TEST_REPO_NAME,
-            ],
-            env=ffx_env,
-            stdout=self.subprocess_output(),
-            stderr=self.subprocess_output(),
-        )
-
-        # Start repository server
-        subprocess.check_call(
-            [ffx_path, "repository", "server", "start", "--address", "[::]:0"],
-            env=ffx_env,
-            stdout=self.subprocess_output(),
-            stderr=self.subprocess_output(),
-        )
-
-        # Register with newly-started emulator
-        subprocess.check_call(
-            [
-                ffx_path,
-                "target",
-                "repository",
-                "register",
-                "--repository",
-                self.TEST_REPO_NAME,
             ],
             env=ffx_env,
             stdout=self.subprocess_output(),
@@ -400,6 +362,28 @@ class TestEnvironment:
 
         # Write to file
         self.write_to_file()
+
+        # Start repository server
+        subprocess.check_call(
+            [ffx_path, "config", "set", "repository.foreground.enabled", "true"],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
+        subprocess.check_call(
+            [
+                ffx_path,
+                "repository",
+                "serve",
+                "--repository",
+                self.TEST_REPO_NAME,
+                "--repo-path",
+                self.repo_dir(),
+            ],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
 
         self.log_info("Success! Your environment is ready to run tests.")
 
@@ -445,7 +429,6 @@ class TestEnvironment:
     meta/{package_name}.cm={package_dir}/meta/{package_name}.cm
     bin/{exe_name}={bin_path}
     lib/{libstd_name}={libstd_path}
-    lib/{libtest_name}={libtest_path}
     lib/ld.so.1={sdk_dir}/arch/{target_arch}/sysroot/dist/lib/ld.so.1
     lib/libfdio.so={sdk_dir}/arch/{target_arch}/dist/libfdio.so
     """
@@ -482,9 +465,6 @@ class TestEnvironment:
         if not libstd_paths:
             raise Exception(f"Failed to locate libstd (in {self.rustlibs_dir()})")
 
-        if not libtest_paths:
-            raise Exception(f"Failed to locate libtest (in {self.rustlibs_dir()})")
-
         # Build a unique, deterministic name for the test using the name of the
         # binary and the last 6 hex digits of the hash of the full path
         def path_checksum(path):
@@ -500,6 +480,7 @@ class TestEnvironment:
         cml_path = os.path.join(package_dir, "meta", f"{package_name}.cml")
         cm_path = os.path.join(package_dir, "meta", f"{package_name}.cm")
         manifest_path = os.path.join(package_dir, f"{package_name}.manifest")
+        manifest_json_path = os.path.join(package_dir, f"package_manifest.json")
         far_path = os.path.join(package_dir, f"{package_name}-0.far")
 
         shared_libs = args.shared_libs[: args.n]
@@ -590,38 +571,61 @@ class TestEnvironment:
                         target=self.target,
                         sdk_dir=self.sdk_dir,
                         libstd_name=os.path.basename(libstd_paths[0]),
-                        libtest_name=os.path.basename(libtest_paths[0]),
                         libstd_path=libstd_paths[0],
-                        libtest_path=libtest_paths[0],
                         target_arch=self.triple_to_arch(self.target),
                     )
                 )
+                # `libtest`` was historically a shared library, but now seems to be (sometimes?)
+                # statically linked. If we find it as a shared library, include it in the manifest.
+                if libtest_paths:
+                    manifest.write(
+                        f"lib/{os.path.basename(libtest_paths[0])}={libtest_paths[0]}\n"
+                    )
                 for shared_lib in shared_libs:
                     manifest.write(f"lib/{os.path.basename(shared_lib)}={shared_lib}\n")
+
+            log("Determining API level...")
+            out = subprocess.check_output(
+                [
+                    self.tool_path("ffx"),
+                    "--machine",
+                    "json",
+                    "version",
+                ],
+                env=self.ffx_cmd_env(),
+                stderr=log_file,
+            )
+            api_level = json.loads(out)["tool_version"]["api_level"]
 
             log("Compiling and archiving manifest...")
 
             subprocess.check_call(
                 [
-                    self.tool_path("pm"),
+                    self.tool_path("ffx"),
+                    "package",
+                    "build",
+                    manifest_path,
                     "-o",
                     package_dir,
-                    "-m",
-                    manifest_path,
-                    "build",
+                    "--api-level",
+                    str(api_level),
                 ],
+                env=self.ffx_cmd_env(),
                 stdout=log_file,
                 stderr=log_file,
             )
+
             subprocess.check_call(
                 [
-                    self.tool_path("pm"),
-                    "-o",
-                    package_dir,
-                    "-m",
-                    manifest_path,
+                    self.tool_path("ffx"),
+                    "package",
                     "archive",
+                    "create",
+                    "-o",
+                    far_path,
+                    manifest_json_path,
                 ],
+                env=self.ffx_cmd_env(),
                 stdout=log_file,
                 stderr=log_file,
             )
@@ -630,17 +634,20 @@ class TestEnvironment:
 
             # Publish package to repo
             with open(self.pm_lockfile_path(), "w") as pm_lockfile:
+                # The locking is required to prevent errors resulting from  simultaneous publishes,
+                # which look like: "Error: failed to publish packages to repository: Calculated hash
+                # did not match the required hash."
                 fcntl.lockf(pm_lockfile.fileno(), fcntl.LOCK_EX)
                 subprocess.check_call(
                     [
-                        self.tool_path("pm"),
+                        self.tool_path("ffx"),
+                        "repository",
                         "publish",
-                        "-a",
-                        "-repo",
-                        self.repo_dir(),
-                        "-f",
+                        "--package-archive",
                         far_path,
+                        self.repo_dir(),
                     ],
+                    env=self.ffx_cmd_env(),
                     stdout=log_file,
                     stderr=log_file,
                 )
